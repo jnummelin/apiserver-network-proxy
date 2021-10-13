@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/metadata"
@@ -136,6 +137,10 @@ type ProxyServer struct {
 	AgentAuthenticationOptions *AgentTokenAuthenticationOptions
 
 	proxyStrategies []ProxyStrategy
+
+	// for agent initiated connections
+	kasConnections map[int64]*connContext
+	nextConnID     int64
 }
 
 // AgentTokenAuthenticationOptions contains list of parameters required for agent token based authentication
@@ -283,7 +288,6 @@ func (s *ProxyServer) removeFrontend(agentID string, connID int64) {
 	if len(s.frontends[agentID]) == 0 {
 		delete(s.frontends, agentID)
 	}
-	return
 }
 
 func (s *ProxyServer) getFrontend(agentID string, connID int64) (*ProxyClientConnection, error) {
@@ -342,6 +346,8 @@ func NewProxyServer(serverID string, proxyStrategies []ProxyStrategy, serverCoun
 		// use the first backendmanager as the Readiness Manager
 		Readiness:       bms[0],
 		proxyStrategies: proxyStrategies,
+		kasConnections:  make(map[int64]*connContext),
+		nextConnID:      1,
 	}
 }
 
@@ -541,7 +547,7 @@ func (s *ProxyServer) validateAuthToken(ctx context.Context, token string) error
 	}
 	r, err := s.AgentAuthenticationOptions.KubernetesClient.AuthenticationV1().TokenReviews().Create(ctx, trReq, metav1.CreateOptions{})
 	if err != nil {
-		return fmt.Errorf("Failed to authenticate request. err:%v", err)
+		return fmt.Errorf("failed to authenticate request. err:%v", err)
 	}
 
 	if r.Status.Error != "" {
@@ -578,12 +584,12 @@ func (s *ProxyServer) validateAuthToken(ctx context.Context, token string) error
 func (s *ProxyServer) authenticateAgentViaToken(ctx context.Context) error {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
-		return fmt.Errorf("Failed to retrieve metadata from context")
+		return fmt.Errorf("failed to retrieve metadata from context")
 	}
 
 	authContext := md.Get(header.AuthenticationTokenContextKey)
 	if len(authContext) == 0 {
-		return fmt.Errorf("Authentication context was not found in metadata")
+		return fmt.Errorf("authentication context was not found in metadata")
 	}
 
 	if len(authContext) > 1 {
@@ -595,7 +601,7 @@ func (s *ProxyServer) authenticateAgentViaToken(ctx context.Context) error {
 	}
 
 	if err := s.validateAuthToken(ctx, strings.TrimPrefix(authContext[0], header.AuthenticationTokenContextSchemePrefix)); err != nil {
-		return fmt.Errorf("Failed to validate authentication token, err:%v", err)
+		return fmt.Errorf("failed to validate authentication token, err:%v", err)
 	}
 
 	klog.V(2).Infoln("Client successfully authenticated via token")
@@ -679,6 +685,11 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 				klog.ErrorS(err, "CLOSE_RSP to frontend failed")
 			}
 		}
+
+		// Close all node -> KAS connections
+		for _, kasConn := range s.kasConnections {
+			kasConn.cleanup()
+		}
 	}()
 
 	for pkt := range recvCh {
@@ -715,7 +726,7 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 		case client.PacketType_DATA:
 			resp := pkt.GetData()
 			klog.V(5).InfoS("Received data from agent", "bytes", len(resp.Data), "agentID", agentID, "connectionID", resp.ConnectID)
-			if resp.ConnectID == int64(KASConnId) {
+			if kasConnCtx, ok := s.kasConnections[resp.ConnectID]; ok {
 				kasConnCtx.dataCh <- resp.Data
 			} else {
 				frontend, err := s.getFrontend(agentID, resp.ConnectID)
@@ -758,10 +769,6 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 	klog.V(5).InfoS("Close backend of agent", "backend", stream, "agentID", agentID)
 }
 
-var kasConnCtx *connContext
-
-const KASConnId int64 = 9999999999
-
 func (s *ProxyServer) handleDialRequest(pkt *client.Packet, backend Backend) {
 	klog.V(4).Infoln("received DIAL_REQ")
 	resp := &client.Packet{
@@ -783,12 +790,11 @@ func (s *ProxyServer) handleDialRequest(pkt *client.Packet, backend Backend) {
 	}
 	metrics.Metrics.ObserveDialLatency(time.Since(start))
 
-	// Even identifiers are used for connections from master to node network,
+	// Odd identifiers are used for connections from node to master network,
 	// increment by 2 to maintain the invariant.
-	//connID := atomic.AddInt64(&a.nextConnID, 2)
-	connID := KASConnId
+	connID := atomic.AddInt64(&s.nextConnID, 2)
 	dataCh := make(chan []byte, 5)
-	kasConnCtx = &connContext{
+	kasConnCtx := &connContext{
 		conn:   conn,
 		dataCh: dataCh,
 		cleanFunc: func() {
@@ -802,7 +808,6 @@ func (s *ProxyServer) handleDialRequest(pkt *client.Packet, backend Backend) {
 					},
 				},
 			}
-
 			if err := backend.Send(req); err != nil {
 				klog.ErrorS(err, "close request failure")
 			}
@@ -813,10 +818,12 @@ func (s *ProxyServer) handleDialRequest(pkt *client.Packet, backend Backend) {
 			}
 
 			close(dataCh)
-			//a.connManager.Delete(connID)
+			delete(s.kasConnections, connID)
 		},
 		backend: backend,
 	}
+
+	s.kasConnections[connID] = kasConnCtx
 
 	resp.GetDialResponse().ConnectID = connID
 	if err := backend.Send(resp); err != nil {
@@ -839,9 +846,6 @@ type connContext struct {
 
 func (c *connContext) cleanup() {
 	c.cleanOnce.Do(c.cleanFunc)
-}
-
-type proxiedKAS struct {
 }
 
 func (s *ProxyServer) remoteToProxy(connID int64, ctx *connContext) {

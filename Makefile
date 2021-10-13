@@ -75,6 +75,17 @@ bin/http-test-server: bin cmd/test-server/main.go
 bin/proxy-server: proto/agent/agent.pb.go konnectivity-client/proto/client/client.pb.go bin cmd/server/main.go
 	GO111MODULE=on go build -o bin/proxy-server cmd/server/main.go
 
+bin/proxy-server-static: proto/agent/agent.pb.go konnectivity-client/proto/client/client.pb.go bin cmd/server/main.go
+	GO111MODULE=on go build -o bin/proxy-server-static -a -ldflags="-w -s -extldflags=-static" cmd/server/main.go
+
+# konnectivity_version = 0.0.24
+# konnectivity_buildimage = golang:1.16-alpine
+# #konnectivity_build_go_tags =
+# konnectivity_build_go_cgo_enabled = 0
+# konnectivity_build_go_flags = "-a"
+# konnectivity_build_go_ldflags = "-w -s"
+# konnectivity_build_go_ldflags_extra = "-extldflags=-static"
+
 ## --------------------------------------
 ## Linting
 ## --------------------------------------
